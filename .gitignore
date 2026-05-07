@@ -1,0 +1,14 @@
+target/
+Cargo.lock
+
+.DS_Store
+
+# IDE
+.idea
+*.iml
+.vscode
+
+.env
+
+# Local Claude Code state
+.claude/
