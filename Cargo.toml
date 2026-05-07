@@ -1,0 +1,19 @@
+[package]
+name = "orb-kit"
+description = "Proof of Humanity (PoH) issuer package for World ID."
+version = "0.1.0"
+license = "MIT"
+edition = "2021"
+authors = ["World Contributors"]
+readme = "./README.md"
+repository = "https://github.com/worldcoin/orb-kit"
+keywords = ["poh", "worldid", "world", "identity", "orb"]
+categories = ["authentication", "api-bindings"]
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+
+[lints.rust]
+missing_docs = "deny"
+dead_code = "deny"
