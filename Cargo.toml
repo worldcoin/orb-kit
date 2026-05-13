@@ -17,3 +17,12 @@ pedantic = { level = "deny", priority = -1 }
 [lints.rust]
 missing_docs = "deny"
 dead_code = "deny"
+
+[dependencies]
+secrecy = "0.10"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+walletkit-db = { path = "../walletkit/walletkit-db" }
+
+[dev-dependencies]
+tempfile = "3"
