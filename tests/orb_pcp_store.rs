@@ -68,7 +68,7 @@ fn open_vault(dir: &tempfile::TempDir) -> Vault {
     Vault::open(
         &dir.path().join(VAULT_FILENAME),
         TEST_TIME,
-        lock,
+        &lock,
         &keystore,
         &blob_store,
     )
@@ -244,7 +244,7 @@ fn state_persists_across_reopens() {
         let vault = Vault::open(
             &dir.path().join(VAULT_FILENAME),
             TEST_TIME,
-            lock,
+            &lock,
             &keystore,
             &blob_store,
         )
@@ -258,7 +258,7 @@ fn state_persists_across_reopens() {
     let vault = Vault::open(
         &dir.path().join(VAULT_FILENAME),
         TEST_TIME,
-        lock,
+        &lock,
         &keystore,
         &blob_store,
     )

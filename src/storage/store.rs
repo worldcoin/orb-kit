@@ -1,8 +1,9 @@
 //! `OrbPcpStore`, the typed CRUD surface over `OrbKit`'s PCP vault.
 //!
-//! Layered on `walletkit_db::Vault`: reads bypass the lock, mutations
-//! acquire it implicitly via `Vault::mutate`. Multi-statement writes run
-//! inside a single `mutate` closure so they are atomic across processes.
+//! Layered on `walletkit_db::Vault`: each method borrows the underlying
+//! [`Connection`] via [`WkVault::connection`] and wraps multi-statement
+//! writes in a `SQLite` transaction. WAL mode serializes writers itself, so
+//! no extra cross-process lock is needed for vault operations.
 
 use std::path::Path;
 
@@ -31,7 +32,8 @@ impl Vault {
     ///
     /// On first use this generates `K_intermediate` and writes the
     /// envelope. On subsequent calls the envelope is unsealed and the same
-    /// bulk key is recovered.
+    /// bulk key is recovered. `lock` is used only by the envelope-init
+    /// bootstrap and released before this returns.
     ///
     /// # Errors
     ///
@@ -40,19 +42,19 @@ impl Vault {
     pub fn open(
         vault_path: &Path,
         envelope_now_seconds: u64,
-        lock: Lock,
+        lock: &Lock,
         keystore: &dyn Keystore,
         blob_store: &dyn AtomicBlobStore,
     ) -> StorageResult<Self> {
         let key = walletkit_db::init_or_open_envelope_key(
             keystore,
             blob_store,
-            &lock,
+            lock,
             ENVELOPE_FILENAME,
             ENVELOPE_AD,
             envelope_now_seconds,
         )?;
-        let inner = WkVault::open(vault_path, &key, lock, ensure_schema)?;
+        let inner = WkVault::open(vault_path, &key, ensure_schema)?;
         Ok(Self { inner })
     }
 
@@ -79,23 +81,23 @@ impl OrbPcpStore<'_> {
     ///
     /// Database errors propagate.
     pub fn init_meta(&self, now_seconds: u64) -> StorageResult<()> {
-        self.vault.mutate(|conn| -> StorageResult<()> {
-            let now_i64 = to_i64(now_seconds, "now")?;
-            let exists: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM vault_meta)",
-                &[],
-                |row| Ok(row.column_i64(0) != 0),
+        let now_i64 = to_i64(now_seconds, "now")?;
+        let conn = self.vault.connection();
+        let tx = conn.transaction()?;
+        let exists: bool =
+            tx.query_row("SELECT EXISTS(SELECT 1 FROM vault_meta)", &[], |row| {
+                Ok(row.column_i64(0) != 0)
+            })?;
+        if !exists {
+            tx.execute(
+                "INSERT INTO vault_meta (
+                    schema_version, sub, current_signup_id, created_at, updated_at
+                 ) VALUES (?1, NULL, NULL, ?2, ?2)",
+                params![SCHEMA_VERSION, now_i64],
             )?;
-            if !exists {
-                conn.execute(
-                    "INSERT INTO vault_meta (
-                        schema_version, sub, current_signup_id, created_at, updated_at
-                     ) VALUES (?1, NULL, NULL, ?2, ?2)",
-                    params![SCHEMA_VERSION, now_i64],
-                )?;
-            }
-            Ok(())
-        })
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Insert (or replace) one tier of a signup's PCP. Writes the blob
@@ -110,38 +112,39 @@ impl OrbPcpStore<'_> {
     /// Database errors propagate. Timestamps overflowing `i64` return
     /// [`StorageError::InvalidState`].
     pub fn put_package(&self, ingest: &PcpIngest<'_>) -> StorageResult<[u8; 32]> {
-        self.vault.mutate(|conn| -> StorageResult<[u8; 32]> {
-            let now_i64 = to_i64(ingest.now_seconds, "now")?;
-            let orb_i64 = to_i64(ingest.orb_created_at_seconds, "orb_created_at")?;
-            let cid = blobs::put(
-                conn,
-                KIND_PCP_PACKAGE,
-                ingest.encrypted_bytes,
-                ingest.now_seconds,
-            )?;
-            conn.execute(
-                "INSERT OR REPLACE INTO pcp_records (
-                    signup_id, tier, version, signup_reason,
-                    status, is_download_acknowledged, creation_source,
-                    package_blob_cid, orb_created_at, created_at, updated_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
-                params![
-                    ingest.signup_id,
-                    i64::from(ingest.tier),
-                    ingest.version,
-                    ingest.signup_reason.unwrap_or_default(),
-                    PackageStatus::Downloaded.as_str(),
-                    i64::from(u8::from(ingest.is_download_acknowledged)),
-                    ingest.creation_source.as_str(),
-                    cid.as_slice(),
-                    orb_i64,
-                    now_i64,
-                ],
-            )?;
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&cid);
-            Ok(out)
-        })
+        let now_i64 = to_i64(ingest.now_seconds, "now")?;
+        let orb_i64 = to_i64(ingest.orb_created_at_seconds, "orb_created_at")?;
+        let conn = self.vault.connection();
+        let tx = conn.transaction()?;
+        let cid = blobs::put(
+            conn,
+            KIND_PCP_PACKAGE,
+            ingest.encrypted_bytes,
+            ingest.now_seconds,
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO pcp_records (
+                signup_id, tier, version, signup_reason,
+                status, is_download_acknowledged, creation_source,
+                package_blob_cid, orb_created_at, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)",
+            params![
+                ingest.signup_id,
+                i64::from(ingest.tier),
+                ingest.version,
+                ingest.signup_reason.unwrap_or_default(),
+                PackageStatus::Downloaded.as_str(),
+                i64::from(u8::from(ingest.is_download_acknowledged)),
+                ingest.creation_source.as_str(),
+                cid.as_slice(),
+                orb_i64,
+                now_i64,
+            ],
+        )?;
+        tx.commit()?;
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&cid);
+        Ok(out)
     }
 
     /// Update the status of every tier of a signup atomically. Rejects
@@ -162,40 +165,41 @@ impl OrbPcpStore<'_> {
         new_source: Option<CreationSource>,
         now_seconds: u64,
     ) -> StorageResult<()> {
-        self.vault.mutate(|conn| -> StorageResult<()> {
-            let now_i64 = to_i64(now_seconds, "now")?;
-            let current = read_signup_statuses(conn, signup_id)?;
-            if current.is_empty() {
+        let now_i64 = to_i64(now_seconds, "now")?;
+        let conn = self.vault.connection();
+        let tx = conn.transaction()?;
+        let current = read_signup_statuses(conn, signup_id)?;
+        if current.is_empty() {
+            return Err(StorageError::InvalidState(format!(
+                "no rows for signup_id={signup_id}"
+            )));
+        }
+        for cur in &current {
+            if *cur != new_status && !cur.can_transition_to(new_status) {
                 return Err(StorageError::InvalidState(format!(
-                    "no rows for signup_id={signup_id}"
+                    "illegal transition {} -> {} for signup_id={signup_id}",
+                    cur.as_str(),
+                    new_status.as_str()
                 )));
             }
-            for cur in &current {
-                if *cur != new_status && !cur.can_transition_to(new_status) {
-                    return Err(StorageError::InvalidState(format!(
-                        "illegal transition {} -> {} for signup_id={signup_id}",
-                        cur.as_str(),
-                        new_status.as_str()
-                    )));
-                }
-            }
-            if let Some(src) = new_source {
-                conn.execute(
-                    "UPDATE pcp_records
-                        SET status = ?1, creation_source = ?2, updated_at = ?3
-                      WHERE signup_id = ?4",
-                    params![new_status.as_str(), src.as_str(), now_i64, signup_id],
-                )?;
-            } else {
-                conn.execute(
-                    "UPDATE pcp_records
-                        SET status = ?1, updated_at = ?2
-                      WHERE signup_id = ?3",
-                    params![new_status.as_str(), now_i64, signup_id],
-                )?;
-            }
-            Ok(())
-        })
+        }
+        if let Some(src) = new_source {
+            tx.execute(
+                "UPDATE pcp_records
+                    SET status = ?1, creation_source = ?2, updated_at = ?3
+                  WHERE signup_id = ?4",
+                params![new_status.as_str(), src.as_str(), now_i64, signup_id],
+            )?;
+        } else {
+            tx.execute(
+                "UPDATE pcp_records
+                    SET status = ?1, updated_at = ?2
+                  WHERE signup_id = ?3",
+                params![new_status.as_str(), now_i64, signup_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Mark one tier as acked. Per-tier, since each tier is downloaded
@@ -210,16 +214,14 @@ impl OrbPcpStore<'_> {
         tier: Tier,
         now_seconds: u64,
     ) -> StorageResult<()> {
-        self.vault.mutate(|conn| -> StorageResult<()> {
-            let now_i64 = to_i64(now_seconds, "now")?;
-            conn.execute(
-                "UPDATE pcp_records
-                    SET is_download_acknowledged = 1, updated_at = ?1
-                  WHERE signup_id = ?2 AND tier = ?3",
-                params![now_i64, signup_id, i64::from(tier)],
-            )?;
-            Ok(())
-        })
+        let now_i64 = to_i64(now_seconds, "now")?;
+        self.vault.connection().execute(
+            "UPDATE pcp_records
+                SET is_download_acknowledged = 1, updated_at = ?1
+              WHERE signup_id = ?2 AND tier = ?3",
+            params![now_i64, signup_id, i64::from(tier)],
+        )?;
+        Ok(())
     }
 
     /// All rows for a signup, ordered by tier ascending.
@@ -228,8 +230,7 @@ impl OrbPcpStore<'_> {
     ///
     /// Database errors propagate.
     pub fn tiers_for_signup(&self, signup_id: &str) -> StorageResult<Vec<PcpRecord>> {
-        let conn = self.vault.read();
-        read_signup_rows(conn, signup_id)
+        read_signup_rows(self.vault.connection(), signup_id)
     }
 
     /// The latest signup that has at least one tier in `Enrolled` status,
@@ -243,7 +244,7 @@ impl OrbPcpStore<'_> {
     ///
     /// Database errors propagate.
     pub fn latest_enrolled(&self) -> StorageResult<Option<Vec<PcpRecord>>> {
-        let conn = self.vault.read();
+        let conn = self.vault.connection();
         let signup: Option<String> = conn.query_row_optional(
             "SELECT signup_id FROM pcp_records
               WHERE status = 'Enrolled'
@@ -266,7 +267,7 @@ impl OrbPcpStore<'_> {
     ///
     /// Database errors propagate.
     pub fn unacked_tiers(&self) -> StorageResult<Vec<(SignupId, Tier)>> {
-        let conn = self.vault.read();
+        let conn = self.vault.connection();
         let mut stmt = conn.prepare(
             "SELECT signup_id, tier FROM pcp_records WHERE is_download_acknowledged = 0",
         )?;
@@ -296,8 +297,6 @@ pub struct PcpIngest<'a> {
     pub orb_created_at_seconds: u64,
     pub now_seconds: u64,
 }
-
-// ---- private SQL helpers ------------------------------------------------
 
 fn to_i64(value: u64, label: &str) -> StorageResult<i64> {
     i64::try_from(value).map_err(|_| {
