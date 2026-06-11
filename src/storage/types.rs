@@ -1,20 +1,17 @@
 //! Public types stored in `pcp_records`.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
 
 use crate::storage::error::StorageError;
 
-/// Opaque server-assigned signup identifier. Sensitive per oxide's logging
-/// rules; do not write to logs.
+/// Server-assigned signup identifier. Sensitive; do not log.
 pub type SignupId = String;
 
-/// Shard identifier within a signup. `0` for untiered PCPs; `0..N` for
-/// tiered PCPs.
+/// Shard index within a signup. `0` for untiered PCPs.
 pub type Tier = u8;
 
-/// Lifecycle state of a single PCP row. Stored as TEXT to match oxide's
-/// JSON serialisation and to keep migration byte-trivial.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Lifecycle state of one PCP row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum PackageStatus {
     Downloaded,
@@ -27,8 +24,7 @@ pub enum PackageStatus {
 }
 
 impl PackageStatus {
-    /// Stable string used as the SQL `TEXT` value. Matches oxide's
-    /// `serde_json` serialisation of the `PackageStatus` enum.
+    /// Stable string used as the SQL `TEXT` value.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -42,12 +38,11 @@ impl PackageStatus {
         }
     }
 
-    /// Parse a `TEXT` value back into the enum.
+    /// Parse a value previously produced by [`Self::as_str`].
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::InvalidState`] if the string is not one of
-    /// the seven valid values.
+    /// [`StorageError::InvalidState`] for any other input.
     pub fn parse(s: &str) -> Result<Self, StorageError> {
         match s {
             "Downloaded" => Ok(Self::Downloaded),
@@ -63,10 +58,8 @@ impl PackageStatus {
         }
     }
 
-    /// Whether `next` is a legal transition from `self`.
-    ///
-    /// Used by [`crate::storage::OrbPcpStore::update_status`] to reject
-    /// illegal flips at the boundary.
+    /// `true` iff moving from `self` to `next` is allowed by the state
+    /// machine. Used by [`crate::storage::OrbPcpStore::update_status`].
     #[must_use]
     pub const fn can_transition_to(self, next: Self) -> bool {
         matches!(
@@ -87,8 +80,14 @@ impl PackageStatus {
     }
 }
 
+impl fmt::Display for PackageStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// How a PCP row came to exist on the device.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub enum CreationSource {
     UserCentricEnrollment,
@@ -111,12 +110,11 @@ impl CreationSource {
         }
     }
 
-    /// Parse a `TEXT` value back into the enum.
+    /// Parse a value previously produced by [`Self::as_str`].
     ///
     /// # Errors
     ///
-    /// Returns [`StorageError::InvalidState`] if the string is not one of
-    /// the five valid values.
+    /// [`StorageError::InvalidState`] for any other input.
     pub fn parse(s: &str) -> Result<Self, StorageError> {
         match s {
             "UserCentricEnrollment" => Ok(Self::UserCentricEnrollment),
@@ -131,7 +129,7 @@ impl CreationSource {
     }
 }
 
-/// A row of `pcp_records`, hydrated as a struct.
+/// A row of `pcp_records`. Timestamps are Unix seconds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(missing_docs)]
 pub struct PcpRecord {

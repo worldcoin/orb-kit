@@ -3,23 +3,26 @@
 use thiserror::Error;
 use walletkit_db::{DbError, StoreError};
 
+use crate::storage::types::PackageStatus;
+
 /// Result alias for [`StorageError`].
 pub type StorageResult<T> = Result<T, StorageError>;
 
-/// Errors raised by [`crate::storage::OrbPcpStore`] and related operations.
+/// Errors raised by [`crate::storage::OrbPcpStore`].
 #[derive(Debug, Error)]
+#[allow(missing_docs)]
 pub enum StorageError {
-    /// Underlying error from `walletkit-db` (vault open, blob IO, envelope,
-    /// lock, integrity check).
     #[error("walletkit-db: {0}")]
     WalletKitDb(#[from] StoreError),
-    /// Low-level `SQLite` error surfaced from a direct query (statement
-    /// prepare, step, bind).
     #[error("sqlite: {0}")]
     Db(#[from] DbError),
-    /// Attempted a value that violates the row state machine
-    /// (illegal status transition, malformed enum string, negative
-    /// timestamp).
+    #[error("no rows for the requested signup")]
+    SignupNotFound,
+    #[error("illegal status transition: {from} -> {to}")]
+    IllegalTransition {
+        from: PackageStatus,
+        to: PackageStatus,
+    },
     #[error("invalid state: {0}")]
     InvalidState(String),
 }

@@ -22,7 +22,7 @@ dead_code = "deny"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-walletkit-db = { path = "../walletkit/walletkit-db" }
+walletkit-db = "0.20.0"
 
 [dev-dependencies]
 tempfile = "3"

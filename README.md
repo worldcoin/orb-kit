@@ -10,34 +10,41 @@ Part of the [World ID SDK](https://docs.world.org/world-id).
 
 - Holds the user's PCPs in an encrypted, on-device store.
 - Tracks each signup's lifecycle: download, enrollment submission, success, failure, abandonment, identity deletion.
-- Knows which PCP is the active one and supports re-authentication and pioneer-reset flows that supersede it.
-- Acks downloads, supports per-tier shards of a single signup, and cleans up bytes when a PCP is no longer referenced.
+- Knows which PCP is the latest enrolled one and supports re-authentication and pioneer-reset flows that supersede it.
+- Acks downloads and supports per-tier shards of a single signup.
 
 The encrypted storage is provided by [`walletkit-db`](https://github.com/worldcoin/walletkit/tree/main/walletkit-db); OrbKit composes its PCP schema and access patterns on top.
+
+## How storage is protected
+
+OrbKit's PCP vault is a sqlite3mc-encrypted `SQLite` file. Page-level encryption uses a 32-byte working key (`K_intermediate`); that key is itself sealed under the device's hardware keystore key (`K_device`) using ChaCha20-Poly1305 AEAD with a per-consumer associated-data string, and persisted as a CBOR envelope.
+
+Sealing and unsealing happen inside the device's TEE (Secure Enclave on iOS, TEE / StrongBox on Android). `K_device` never crosses into app memory. Lose the device, lose `K_device`, lose the vault permanently — recovery comes through a separate backup path, not through the envelope.
+
+For the seal / unseal flow, full key hierarchy, and threat model, see [`walletkit-db`'s README](https://github.com/worldcoin/walletkit/tree/main/walletkit-db).
 
 ## Public API
 
 ```rust
-use orb_kit::storage::{Vault, OrbPcpStore, PackageStatus, CreationSource};
+use orb_kit::storage::{OrbPcpStore, PcpIngest, PackageStatus, CreationSource};
 
 // Open the encrypted PCP vault for this device.
-let vault = Vault::open(&vault_path, now, lock, &keystore, &blob_store)?;
-let store = vault.store();
+let store = OrbPcpStore::open(&vault_path, now, &lock, &keystore, &blob_store)?;
 
 // Ingest a downloaded PCP (one tier of a signup).
 store.put_package(&ingest)?;
 
-// Advance the enrollment state machine.
+// Advance the enrollment state machine across every tier of a signup.
 store.update_status(signup_id, PackageStatus::EnrollmentRequestInitiated, None, now)?;
 
-// After a successful re-auth, promote the new signup atomically.
-store.promote_to_current(new_signup_id, Some(CreationSource::ReAuthentication), now)?;
+// Record a successful download ack for one tier.
+store.mark_ack(signup_id, tier, now)?;
 
-// Read the active PCP (all tier shards).
-let tiers = store.current_pcp_tiers()?;
+// Read the latest signup with at least one tier in `Enrolled` status.
+let tiers = store.latest_enrolled()?;
 ```
 
-The full API surface is in [`src/storage`](src/storage). Notable types: `Vault`, `OrbPcpStore`, `PcpRecord`, `PackageStatus`, `CreationSource`, `StorageError`.
+The full API surface is in [`src/storage`](src/storage). Public types: `OrbPcpStore`, `PcpIngest`, `PcpRecord`, `PackageStatus`, `CreationSource`, `StorageError`.
 
 ## Development
 

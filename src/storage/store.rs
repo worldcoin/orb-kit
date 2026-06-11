@@ -1,44 +1,36 @@
-//! `OrbPcpStore`, the typed CRUD surface over `OrbKit`'s PCP vault.
+//! `OrbPcpStore`, typed CRUD over `OrbKit`'s PCP vault.
 //!
-//! Layered on `walletkit_db::Vault`: each method borrows the underlying
-//! [`Connection`] via [`WkVault::connection`] and wraps multi-statement
-//! writes in a `SQLite` transaction. WAL mode serializes writers itself, so
-//! no extra cross-process lock is needed for vault operations.
+//! Reads borrow the connection; multi-statement writes wrap
+//! `Connection::transaction`. WAL handles writer serialization, so no
+//! cross-process lock is held outside the envelope-init bootstrap.
 
 use std::path::Path;
 
 use walletkit_db::{
-    blobs, params, AtomicBlobStore, Connection, Keystore, Lock, StepResult,
-    Vault as WkVault,
+    blobs, params, AtomicBlobStore, Connection, Keystore, Lock, Row, StepResult, Value,
+    Vault,
 };
 
-use crate::storage::blob_kinds::KIND_PCP_PACKAGE;
 use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::paths::{ENVELOPE_AD, ENVELOPE_FILENAME};
-use crate::storage::schema::{ensure_schema, SCHEMA_VERSION};
+use crate::storage::schema::ensure_schema;
 use crate::storage::types::{CreationSource, PackageStatus, PcpRecord, SignupId, Tier};
 
-/// `OrbKit`'s encrypted PCP vault.
-///
-/// Wraps `walletkit_db::Vault` with PCP-shaped read / mutate helpers.
-/// Construct via [`Vault::open`], then call the operations on it.
-pub struct Vault {
-    inner: WkVault,
+/// Blob kind tag distinguishing PCP package bytes from any other blob
+/// kinds we add later. Must stay stable: it's hashed into `content_id`.
+const KIND_PCP_PACKAGE: u8 = 1;
+
+/// Typed CRUD surface over `pcp_records`.
+pub struct OrbPcpStore {
+    vault: Vault,
 }
 
-impl Vault {
-    /// Open the `OrbKit` vault, sealing the bulk key with `keystore` and
-    /// persisting the envelope via `blob_store`.
-    ///
-    /// On first use this generates `K_intermediate` and writes the
-    /// envelope. On subsequent calls the envelope is unsealed and the same
-    /// bulk key is recovered. `lock` is used only by the envelope-init
-    /// bootstrap and released before this returns.
+impl OrbPcpStore {
+    /// Open (or create) the encrypted PCP vault.
     ///
     /// # Errors
     ///
-    /// Propagates errors from envelope IO, keystore seal / open, vault
-    /// open, schema setup, or the integrity check.
+    /// Propagates envelope, vault, schema, and integrity-check failures.
     pub fn open(
         vault_path: &Path,
         envelope_now_seconds: u64,
@@ -54,63 +46,16 @@ impl Vault {
             ENVELOPE_AD,
             envelope_now_seconds,
         )?;
-        let inner = WkVault::open(vault_path, &key, ensure_schema)?;
-        Ok(Self { inner })
+        let vault = Vault::open(vault_path, &key, ensure_schema)?;
+        Ok(Self { vault })
     }
 
-    /// Borrow the typed PCP store.
-    #[must_use]
-    pub const fn store(&self) -> OrbPcpStore<'_> {
-        OrbPcpStore { vault: &self.inner }
-    }
-}
-
-/// Typed CRUD surface over `pcp_records` and `vault_meta`.
-///
-/// Borrowed from [`Vault::store`]; cheap to recreate, holds no state of
-/// its own.
-pub struct OrbPcpStore<'a> {
-    vault: &'a WkVault,
-}
-
-impl OrbPcpStore<'_> {
-    /// Initialise `vault_meta` with the current schema version. Idempotent:
-    /// repeated calls are no-ops once the singleton row exists.
+    /// Insert (or replace) one tier of a signup.
     ///
     /// # Errors
     ///
-    /// Database errors propagate.
-    pub fn init_meta(&self, now_seconds: u64) -> StorageResult<()> {
-        let now_i64 = to_i64(now_seconds, "now")?;
-        let conn = self.vault.connection();
-        let tx = conn.transaction()?;
-        let exists: bool =
-            tx.query_row("SELECT EXISTS(SELECT 1 FROM vault_meta)", &[], |row| {
-                Ok(row.column_i64(0) != 0)
-            })?;
-        if !exists {
-            tx.execute(
-                "INSERT INTO vault_meta (
-                    schema_version, sub, current_signup_id, created_at, updated_at
-                 ) VALUES (?1, NULL, NULL, ?2, ?2)",
-                params![SCHEMA_VERSION, now_i64],
-            )?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Insert (or replace) one tier of a signup's PCP. Writes the blob
-    /// bytes via `walletkit_db::blobs::put` and a `pcp_records` row in
-    /// one transaction.
-    ///
-    /// Re-inserting with the same `(signup_id, tier)` overwrites the
-    /// existing row (used when the backend re-issues a tier).
-    ///
-    /// # Errors
-    ///
-    /// Database errors propagate. Timestamps overflowing `i64` return
-    /// [`StorageError::InvalidState`].
+    /// Database errors; [`StorageError::InvalidState`] if a timestamp
+    /// overflows `i64`.
     pub fn put_package(&self, ingest: &PcpIngest<'_>) -> StorageResult<[u8; 32]> {
         let now_i64 = to_i64(ingest.now_seconds, "now")?;
         let orb_i64 = to_i64(ingest.orb_created_at_seconds, "orb_created_at")?;
@@ -142,22 +87,16 @@ impl OrbPcpStore<'_> {
             ],
         )?;
         tx.commit()?;
-        let mut out = [0u8; 32];
-        out.copy_from_slice(&cid);
-        Ok(out)
+        Ok(cid)
     }
 
-    /// Update the status of every tier of a signup atomically. Rejects
-    /// illegal transitions via [`PackageStatus::can_transition_to`].
-    /// Idempotent: setting a row to its current status is allowed.
-    ///
-    /// `new_source`, if supplied, overwrites `creation_source` (used when
-    /// the backend re-classifies the signup).
+    /// Move every tier of a signup to `new_status`. Idempotent.
     ///
     /// # Errors
     ///
-    /// `InvalidState` if no rows match `signup_id` or any existing row
-    /// cannot legally transition to `new_status`.
+    /// [`StorageError::SignupNotFound`] if no rows match;
+    /// [`StorageError::IllegalTransition`] if any existing row cannot
+    /// reach `new_status` per [`PackageStatus::can_transition_to`].
     pub fn update_status(
         &self,
         signup_id: &str,
@@ -170,44 +109,36 @@ impl OrbPcpStore<'_> {
         let tx = conn.transaction()?;
         let current = read_signup_statuses(conn, signup_id)?;
         if current.is_empty() {
-            return Err(StorageError::InvalidState(format!(
-                "no rows for signup_id={signup_id}"
-            )));
+            return Err(StorageError::SignupNotFound);
         }
         for cur in &current {
             if *cur != new_status && !cur.can_transition_to(new_status) {
-                return Err(StorageError::InvalidState(format!(
-                    "illegal transition {} -> {} for signup_id={signup_id}",
-                    cur.as_str(),
-                    new_status.as_str()
-                )));
+                return Err(StorageError::IllegalTransition {
+                    from: *cur,
+                    to: new_status,
+                });
             }
         }
-        if let Some(src) = new_source {
-            tx.execute(
-                "UPDATE pcp_records
-                    SET status = ?1, creation_source = ?2, updated_at = ?3
-                  WHERE signup_id = ?4",
-                params![new_status.as_str(), src.as_str(), now_i64, signup_id],
-            )?;
-        } else {
-            tx.execute(
-                "UPDATE pcp_records
-                    SET status = ?1, updated_at = ?2
-                  WHERE signup_id = ?3",
-                params![new_status.as_str(), now_i64, signup_id],
-            )?;
-        }
+        let source_value = new_source
+            .map(CreationSource::as_str)
+            .map_or(Value::Null, |s| Value::Text(s.to_string()));
+        tx.execute(
+            "UPDATE pcp_records
+                SET status = ?1,
+                    creation_source = COALESCE(?2, creation_source),
+                    updated_at = ?3
+              WHERE signup_id = ?4",
+            params![new_status.as_str(), source_value, now_i64, signup_id],
+        )?;
         tx.commit()?;
         Ok(())
     }
 
-    /// Mark one tier as acked. Per-tier, since each tier is downloaded
-    /// and acked independently to the backend.
+    /// Mark one tier acknowledged. Per-tier: each tier acks independently.
     ///
     /// # Errors
     ///
-    /// Database errors propagate.
+    /// Database errors.
     pub fn mark_ack(
         &self,
         signup_id: &str,
@@ -224,25 +155,21 @@ impl OrbPcpStore<'_> {
         Ok(())
     }
 
-    /// All rows for a signup, ordered by tier ascending.
+    /// All rows for `signup_id`, ordered by tier.
     ///
     /// # Errors
     ///
-    /// Database errors propagate.
+    /// Database errors.
     pub fn tiers_for_signup(&self, signup_id: &str) -> StorageResult<Vec<PcpRecord>> {
         read_signup_rows(self.vault.connection(), signup_id)
     }
 
-    /// The latest signup that has at least one tier in `Enrolled` status,
-    /// returned as all of its tier rows ordered by tier ascending. `None`
-    /// if no signup is currently `Enrolled`.
-    ///
-    /// Latest is defined as `MAX(orb_created_at)` across `Enrolled` rows.
-    /// This replaces oxide's `find_enrolled_pcp`.
+    /// All tiers of the latest signup with at least one `Enrolled` row,
+    /// or `None` if none. Latest = `MAX(orb_created_at)` across enrolled.
     ///
     /// # Errors
     ///
-    /// Database errors propagate.
+    /// Database errors.
     pub fn latest_enrolled(&self) -> StorageResult<Option<Vec<PcpRecord>>> {
         let conn = self.vault.connection();
         let signup: Option<String> = conn.query_row_optional(
@@ -260,12 +187,12 @@ impl OrbPcpStore<'_> {
         }
     }
 
-    /// All `(signup_id, tier)` pairs whose ack is still pending. Used by
-    /// the cold-start retry path that re-sends ack to the backend.
+    /// All `(signup_id, tier)` pairs with pending ack. For cold-start
+    /// ack retry.
     ///
     /// # Errors
     ///
-    /// Database errors propagate.
+    /// Database errors.
     pub fn unacked_tiers(&self) -> StorageResult<Vec<(SignupId, Tier)>> {
         let conn = self.vault.connection();
         let mut stmt = conn.prepare(
@@ -304,6 +231,11 @@ fn to_i64(value: u64, label: &str) -> StorageResult<i64> {
     })
 }
 
+fn nonneg_u64(row: &Row<'_, '_>, idx: usize, label: &str) -> StorageResult<u64> {
+    u64::try_from(row.column_i64(idx))
+        .map_err(|_| StorageError::InvalidState(format!("{label} negative")))
+}
+
 fn read_signup_statuses(
     conn: &Connection,
     signup_id: &str,
@@ -338,7 +270,7 @@ fn read_signup_rows(
     Ok(out)
 }
 
-fn row_to_record(row: &walletkit_db::Row<'_, '_>) -> StorageResult<PcpRecord> {
+fn row_to_record(row: &Row<'_, '_>) -> StorageResult<PcpRecord> {
     let signup_id = row.column_text(0);
     let tier_i64 = row.column_i64(1);
     let tier = u8::try_from(tier_i64).map_err(|_| {
@@ -363,12 +295,6 @@ fn row_to_record(row: &walletkit_db::Row<'_, '_>) -> StorageResult<PcpRecord> {
     }
     let mut cid = [0u8; 32];
     cid.copy_from_slice(&cid_bytes);
-    let orb_created_at = u64::try_from(row.column_i64(8))
-        .map_err(|_| StorageError::InvalidState("orb_created_at negative".into()))?;
-    let created_at = u64::try_from(row.column_i64(9))
-        .map_err(|_| StorageError::InvalidState("created_at negative".into()))?;
-    let updated_at = u64::try_from(row.column_i64(10))
-        .map_err(|_| StorageError::InvalidState("updated_at negative".into()))?;
     Ok(PcpRecord {
         signup_id,
         tier,
@@ -378,8 +304,8 @@ fn row_to_record(row: &walletkit_db::Row<'_, '_>) -> StorageResult<PcpRecord> {
         is_download_acknowledged: ack,
         creation_source,
         package_blob_cid: cid,
-        orb_created_at,
-        created_at,
-        updated_at,
+        orb_created_at: nonneg_u64(row, 8, "orb_created_at")?,
+        created_at: nonneg_u64(row, 9, "created_at")?,
+        updated_at: nonneg_u64(row, 10, "updated_at")?,
     })
 }
