@@ -50,13 +50,61 @@ impl OrbPcpStore {
         Ok(Self { vault })
     }
 
-    /// Insert (or replace) one tier of a signup.
+    /// Insert (or replace) one tier of a signup with status `Downloaded`.
     ///
     /// # Errors
     ///
     /// Database errors; [`StorageError::InvalidState`] if a timestamp
     /// overflows `i64`.
     pub fn put_package(&self, ingest: &PcpIngest<'_>) -> StorageResult<[u8; 32]> {
+        self.ingest_with_status(ingest, PackageStatus::Downloaded)
+    }
+
+    /// Insert one tier with `status` set directly, bypassing the state
+    /// machine. For backfilling legacy rows during migration.
+    ///
+    /// # Errors
+    ///
+    /// Database errors; [`StorageError::InvalidState`] if a timestamp
+    /// overflows `i64`.
+    pub fn ingest_legacy(
+        &self,
+        ingest: &PcpIngest<'_>,
+        status: PackageStatus,
+    ) -> StorageResult<[u8; 32]> {
+        self.ingest_with_status(ingest, status)
+    }
+
+    /// True once [`Self::mark_migrated`] has run.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn is_migrated(&self) -> StorageResult<bool> {
+        let v: i64 =
+            self.vault
+                .connection()
+                .query_row("PRAGMA user_version", &[], |row| Ok(row.column_i64(0)))?;
+        Ok(v != 0)
+    }
+
+    /// Set the migration marker. Idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn mark_migrated(&self) -> StorageResult<()> {
+        self.vault
+            .connection()
+            .execute_batch("PRAGMA user_version = 1")?;
+        Ok(())
+    }
+
+    fn ingest_with_status(
+        &self,
+        ingest: &PcpIngest<'_>,
+        status: PackageStatus,
+    ) -> StorageResult<[u8; 32]> {
         let now_i64 = to_i64(ingest.now_seconds, "now")?;
         let orb_i64 = to_i64(ingest.orb_created_at_seconds, "orb_created_at")?;
         let conn = self.vault.connection();
@@ -78,7 +126,7 @@ impl OrbPcpStore {
                 i64::from(ingest.tier),
                 ingest.version,
                 ingest.signup_reason.unwrap_or_default(),
-                PackageStatus::Downloaded.as_str(),
+                status.as_str(),
                 i64::from(u8::from(ingest.is_download_acknowledged)),
                 ingest.creation_source.as_str(),
                 cid.as_slice(),
