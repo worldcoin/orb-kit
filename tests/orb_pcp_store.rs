@@ -230,6 +230,86 @@ fn latest_enrolled_is_none_when_no_enrolled_signup() {
 }
 
 #[test]
+fn ingest_legacy_preserves_explicit_status() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = open_store(&dir);
+
+    // A status put_package would never produce (it always starts at Downloaded).
+    store
+        .ingest_legacy(&ingest("legacy-sig", 0), PackageStatus::Enrolled)
+        .expect("ingest_legacy");
+
+    let rows = store.tiers_for_signup("legacy-sig").expect("tiers");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, PackageStatus::Enrolled);
+}
+
+#[test]
+fn ingest_legacy_replaces_existing_row() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = open_store(&dir);
+
+    store
+        .ingest_legacy(
+            &ingest("legacy-sig", 0),
+            PackageStatus::EnrollmentRequestInitiated,
+        )
+        .expect("first ingest");
+    store
+        .ingest_legacy(&ingest("legacy-sig", 0), PackageStatus::Enrolled)
+        .expect("re-ingest same (signup_id, tier)");
+
+    let rows = store.tiers_for_signup("legacy-sig").expect("tiers");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, PackageStatus::Enrolled);
+}
+
+#[test]
+fn migration_marker_roundtrip() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = open_store(&dir);
+
+    assert!(!store.is_migrated().expect("read marker"));
+    store.mark_migrated().expect("set marker");
+    assert!(store.is_migrated().expect("read marker after set"));
+    // Idempotent.
+    store.mark_migrated().expect("set marker again");
+    assert!(store.is_migrated().expect("still set"));
+}
+
+#[test]
+fn migration_marker_persists_across_reopens() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let keystore = XorKeystore { pad: [0xA5; 32] };
+    let blob_store = InMemoryBlobs::default();
+
+    {
+        let lock = Lock::open(&dir.path().join(LOCK_FILENAME)).expect("open lock");
+        let store = OrbPcpStore::open(
+            &dir.path().join(VAULT_FILENAME),
+            TEST_TIME,
+            &lock,
+            &keystore,
+            &blob_store,
+        )
+        .expect("open store");
+        assert!(!store.is_migrated().expect("marker starts unset"));
+        store.mark_migrated().expect("set marker");
+    }
+
+    let lock = Lock::open(&dir.path().join(LOCK_FILENAME)).expect("reopen lock");
+    let store = OrbPcpStore::open(
+        &dir.path().join(VAULT_FILENAME),
+        TEST_TIME,
+        &lock,
+        &keystore,
+        &blob_store,
+    )
+    .expect("reopen store");
+    assert!(store.is_migrated().expect("marker survives reopen"));
+}
+
+#[test]
 fn state_persists_across_reopens() {
     let dir = tempfile::tempdir().expect("temp dir");
     let keystore = XorKeystore { pad: [0xC3; 32] };
