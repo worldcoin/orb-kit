@@ -83,7 +83,7 @@ impl OrbPcpStore {
                 ingest.signup_id,
                 i64::from(ingest.tier),
                 ingest.version,
-                ingest.signup_reason.unwrap_or_default(),
+                ingest.signup_reason.map_or(Value::Null, Value::from),
                 PackageStatus::Downloaded.as_str(),
                 i64::from(u8::from(ingest.is_download_acknowledged)),
                 ingest.creation_source.as_str(),
@@ -113,14 +113,14 @@ impl OrbPcpStore {
         let now_i64 = to_i64(now_seconds, "now")?;
         let conn = self.vault.connection();
         let tx = conn.transaction()?;
-        let current = read_signup_statuses(conn, signup_id)?;
+        let current = read_signup_rows(conn, signup_id)?;
         if current.is_empty() {
             return Err(StorageError::SignupNotFound);
         }
-        for cur in &current {
-            if *cur != new_status && !cur.can_transition_to(new_status) {
+        for cur in current.iter().map(|r| r.status) {
+            if cur != new_status && !cur.can_transition_to(new_status) {
                 return Err(StorageError::IllegalTransition {
-                    from: *cur,
+                    from: cur,
                     to: new_status,
                 });
             }
@@ -187,12 +187,7 @@ impl OrbPcpStore {
         )?;
         let mut out = Vec::new();
         while let StepResult::Row(row) = stmt.step()? {
-            let signup_id: String = row.column_text(0);
-            let tier_i64 = row.column_i64(1);
-            let tier = u8::try_from(tier_i64).map_err(|_| {
-                StorageError::InvalidState(format!("tier out of range: {tier_i64}"))
-            })?;
-            out.push((signup_id, tier));
+            out.push((row.column_text(0), tier_at(&row, 1)?));
         }
         Ok(out)
     }
@@ -234,32 +229,7 @@ fn read_existing_cid(
         params![signup_id, i64::from(tier)],
         |row| Ok(row.column_blob(0)),
     )?;
-    match cid_bytes {
-        Some(bytes) if bytes.len() == 32 => {
-            let mut cid = [0u8; 32];
-            cid.copy_from_slice(&bytes);
-            Ok(Some(cid))
-        }
-        Some(bytes) => Err(StorageError::InvalidState(format!(
-            "package_blob_cid len {} != 32",
-            bytes.len()
-        ))),
-        None => Ok(None),
-    }
-}
-
-fn read_signup_statuses(
-    conn: &Connection,
-    signup_id: &str,
-) -> StorageResult<Vec<PackageStatus>> {
-    let mut stmt = conn
-        .prepare("SELECT status FROM pcp_records WHERE signup_id = ?1 ORDER BY tier")?;
-    stmt.bind_values(params![signup_id])?;
-    let mut out = Vec::new();
-    while let StepResult::Row(row) = stmt.step()? {
-        out.push(PackageStatus::parse(&row.column_text(0))?);
-    }
-    Ok(out)
+    cid_bytes.map(to_cid).transpose()
 }
 
 fn read_signup_rows(
@@ -283,41 +253,30 @@ fn read_signup_rows(
 }
 
 fn row_to_record(row: &Row<'_, '_>) -> StorageResult<PcpRecord> {
-    let signup_id = row.column_text(0);
-    let tier_i64 = row.column_i64(1);
-    let tier = u8::try_from(tier_i64).map_err(|_| {
-        StorageError::InvalidState(format!("tier out of range: {tier_i64}"))
-    })?;
-    let version = row.column_text(2);
-    let signup_reason_text = row.column_text(3);
-    let signup_reason = if signup_reason_text.is_empty() {
-        None
-    } else {
-        Some(signup_reason_text)
-    };
-    let status = PackageStatus::parse(&row.column_text(4))?;
-    let ack = row.column_i64(5) != 0;
-    let creation_source = CreationSource::parse(&row.column_text(6))?;
-    let cid_bytes = row.column_blob(7);
-    if cid_bytes.len() != 32 {
-        return Err(StorageError::InvalidState(format!(
-            "package_blob_cid len {} != 32",
-            cid_bytes.len()
-        )));
-    }
-    let mut cid = [0u8; 32];
-    cid.copy_from_slice(&cid_bytes);
     Ok(PcpRecord {
-        signup_id,
-        tier,
-        version,
-        signup_reason,
-        status,
-        is_download_acknowledged: ack,
-        creation_source,
-        package_blob_cid: cid,
+        signup_id: row.column_text(0),
+        tier: tier_at(row, 1)?,
+        version: row.column_text(2),
+        signup_reason: (!row.is_column_null(3)).then(|| row.column_text(3)),
+        status: PackageStatus::parse(&row.column_text(4))?,
+        is_download_acknowledged: row.column_i64(5) != 0,
+        creation_source: CreationSource::parse(&row.column_text(6))?,
+        package_blob_cid: to_cid(row.column_blob(7))?,
         orb_created_at: nonneg_u64(row, 8, "orb_created_at")?,
         created_at: nonneg_u64(row, 9, "created_at")?,
         updated_at: nonneg_u64(row, 10, "updated_at")?,
+    })
+}
+
+fn tier_at(row: &Row<'_, '_>, idx: usize) -> StorageResult<Tier> {
+    let tier = row.column_i64(idx);
+    u8::try_from(tier)
+        .map_err(|_| StorageError::InvalidState(format!("tier out of range: {tier}")))
+}
+
+fn to_cid(bytes: Vec<u8>) -> StorageResult<[u8; 32]> {
+    let len = bytes.len();
+    <[u8; 32]>::try_from(bytes).map_err(|_| {
+        StorageError::InvalidState(format!("package_blob_cid len {len} != 32"))
     })
 }
