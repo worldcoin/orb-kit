@@ -50,35 +50,34 @@ impl OrbPcpStore {
         Ok(Self { vault })
     }
 
-    /// Insert a signup's PCP with status `Downloaded`. Strict: errors if
-    /// the signup already exists, so a re-download can't reset a row
-    /// that has moved past `Downloaded`.
+    /// Insert a signup's PCP with status `Downloaded`. A repeat download
+    /// only merges the ack flag, so it can't rewind a row that has moved
+    /// past `Downloaded`. Returns the stored package's content id.
     ///
     /// # Errors
     ///
-    /// [`StorageError::AlreadyExists`] if the row exists. Database
-    /// errors; [`StorageError::InvalidState`] if a timestamp overflows
-    /// `i64`.
+    /// Database errors; [`StorageError::InvalidState`] if a timestamp
+    /// overflows `i64`.
     pub fn put_package(&self, ingest: &PcpIngest<'_>) -> StorageResult<[u8; 32]> {
         let now_i64 = to_i64(ingest.now_seconds, "now")?;
         let orb_i64 = to_i64(ingest.orb_created_at_seconds, "orb_created_at")?;
         let conn = self.vault.connection();
         let tx = conn.transaction()?;
-        if read_record(conn, ingest.signup_id)?.is_some() {
-            return Err(StorageError::AlreadyExists);
-        }
         let cid = blobs::put(
             conn,
             KIND_PCP_PACKAGE,
             ingest.encrypted_bytes,
             ingest.now_seconds,
         )?;
-        tx.execute(
+        let stored_cid = conn.query_row(
             "INSERT INTO pcp_records (
                 signup_id, version, signup_reason,
                 status, is_download_acknowledged, creation_source,
                 package_blob_cid, orb_created_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+             ON CONFLICT (signup_id) DO UPDATE SET is_download_acknowledged =
+                 is_download_acknowledged OR excluded.is_download_acknowledged
+             RETURNING package_blob_cid",
             params![
                 ingest.signup_id,
                 ingest.version,
@@ -90,9 +89,10 @@ impl OrbPcpStore {
                 orb_i64,
                 now_i64,
             ],
+            |row| Ok(row.column_blob(0)),
         )?;
         tx.commit()?;
-        Ok(cid)
+        to_cid(stored_cid)
     }
 
     /// Move a signup to `new_status`. Idempotent.

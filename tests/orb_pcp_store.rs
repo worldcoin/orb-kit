@@ -157,11 +157,11 @@ fn update_status_on_unknown_signup_returns_not_found() {
 }
 
 #[test]
-fn put_package_errors_when_row_already_exists() {
+fn repeat_download_merges_ack_and_keeps_status() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = open_store(&dir);
 
-    store.put_package(&ingest("dup")).expect("first put");
+    let first_cid = store.put_package(&ingest("dup")).expect("first put");
     store
         .update_status(
             "dup",
@@ -170,15 +170,15 @@ fn put_package_errors_when_row_already_exists() {
             TEST_TIME + 2,
         )
         .expect("advance");
-    let err = store
-        .put_package(&ingest("dup"))
-        .expect_err("second put on same signup should error");
-    assert!(matches!(err, StorageError::AlreadyExists));
+    let mut repeat = ingest("dup");
+    repeat.is_download_acknowledged = true;
+    repeat.encrypted_bytes = b"different-bytes";
+    let repeat_cid = store.put_package(&repeat).expect("repeat put");
+    assert_eq!(repeat_cid, first_cid);
 
-    assert_eq!(
-        get(&store, "dup").status,
-        PackageStatus::EnrollmentRequestInitiated
-    );
+    let row = get(&store, "dup");
+    assert!(row.is_download_acknowledged);
+    assert_eq!(row.status, PackageStatus::EnrollmentRequestInitiated);
 }
 
 #[test]
