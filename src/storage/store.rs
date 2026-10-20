@@ -14,7 +14,7 @@ use walletkit_db::{
 use crate::storage::error::{StorageError, StorageResult};
 use crate::storage::paths::{ENVELOPE_AD, ENVELOPE_FILENAME};
 use crate::storage::schema::ensure_schema;
-use crate::storage::types::{CreationSource, PackageStatus, PcpRecord, Tier};
+use crate::storage::types::{CreationSource, PackageStatus, PcpRecord, SignupId, Tier};
 
 /// Blob kind tag distinguishing PCP package bytes from any other blob
 /// kinds we add later. Must stay stable: it's hashed into `content_id`.
@@ -147,6 +147,54 @@ impl OrbPcpStore {
     /// Database errors.
     pub fn tiers_for_signup(&self, signup_id: &str) -> StorageResult<Vec<PcpRecord>> {
         read_signup_rows(self.vault.connection(), signup_id)
+    }
+
+    /// Mark one tier acknowledged. Per-tier: each tier acks independently.
+    ///
+    /// # Errors
+    ///
+    /// [`StorageError::SignupNotFound`] if no row matches
+    /// `(signup_id, tier)`. Database errors.
+    pub fn mark_ack(
+        &self,
+        signup_id: &str,
+        tier: Tier,
+        now_seconds: u64,
+    ) -> StorageResult<()> {
+        let now_i64 = to_i64(now_seconds, "now")?;
+        let rows = self.vault.connection().execute(
+            "UPDATE pcp_records
+                SET is_download_acknowledged = 1, updated_at = ?1
+              WHERE signup_id = ?2 AND tier = ?3",
+            params![now_i64, signup_id, i64::from(tier)],
+        )?;
+        if rows == 0 {
+            return Err(StorageError::SignupNotFound);
+        }
+        Ok(())
+    }
+
+    /// All `(signup_id, tier)` pairs with pending ack. For cold-start
+    /// ack retry.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    pub fn unacked_tiers(&self) -> StorageResult<Vec<(SignupId, Tier)>> {
+        let conn = self.vault.connection();
+        let mut stmt = conn.prepare(
+            "SELECT signup_id, tier FROM pcp_records WHERE is_download_acknowledged = 0",
+        )?;
+        let mut out = Vec::new();
+        while let StepResult::Row(row) = stmt.step()? {
+            let signup_id: String = row.column_text(0);
+            let tier_i64 = row.column_i64(1);
+            let tier = u8::try_from(tier_i64).map_err(|_| {
+                StorageError::InvalidState(format!("tier out of range: {tier_i64}"))
+            })?;
+            out.push((signup_id, tier));
+        }
+        Ok(out)
     }
 }
 

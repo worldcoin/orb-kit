@@ -190,6 +190,38 @@ fn put_package_errors_when_row_already_exists() {
 }
 
 #[test]
+fn mark_ack_scopes_to_one_tier() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = open_store(&dir);
+
+    for tier in 0..2 {
+        store.put_package(&ingest("sig-1", tier)).expect("put tier");
+    }
+    store
+        .mark_ack("sig-1", 0, TEST_TIME + 5)
+        .expect("ack tier 0");
+
+    let rows = store.tiers_for_signup("sig-1").expect("tiers");
+    assert!(rows[0].is_download_acknowledged);
+    assert!(!rows[1].is_download_acknowledged);
+    assert_eq!(
+        store.unacked_tiers().expect("unacked"),
+        vec![("sig-1".to_string(), 1)],
+    );
+}
+
+#[test]
+fn mark_ack_errors_when_row_not_found() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let store = open_store(&dir);
+
+    let err = store
+        .mark_ack("no-such-signup", 0, TEST_TIME + 5)
+        .expect_err("ack on missing row should error");
+    assert!(matches!(err, StorageError::SignupNotFound));
+}
+
+#[test]
 fn state_persists_across_reopens() {
     let dir = tempfile::tempdir().expect("temp dir");
     let keystore = XorKeystore { pad: [0xC3; 32] };
