@@ -1,10 +1,9 @@
 //! Encrypted PCP storage on top of `walletkit-db`.
 
-pub mod error;
-pub mod paths;
-pub mod schema;
-pub mod store;
-pub mod types;
+mod error;
+mod schema;
+mod store;
+mod types;
 
 pub use error::{StorageError, StorageResult};
 pub use store::{OrbPcpStore, PcpIngest};

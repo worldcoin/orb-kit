@@ -19,8 +19,6 @@ missing_docs = "deny"
 dead_code = "deny"
 
 [dependencies]
-secrecy = "0.10"
-serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 walletkit-db = "0.20.4"
 

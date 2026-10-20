@@ -12,6 +12,3 @@ Cargo.lock
 
 # Local Claude Code state
 .claude/
-tmp/
-
-.planning/

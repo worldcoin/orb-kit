@@ -8,10 +8,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use orb_kit::storage::{
-    paths::{LOCK_FILENAME, VAULT_FILENAME},
     CreationSource, OrbPcpStore, PackageStatus, PcpIngest, PcpRecord, StorageError,
 };
-use walletkit_db::{AtomicBlobStore, Keystore, Lock, StoreResult};
+use walletkit_db::{AtomicBlobStore, Keystore, StoreResult};
 
 const TEST_TIME: u64 = 1_700_000_000;
 const SAMPLE_PCP_BYTES: &[u8] = b"fake-encrypted-pcp-bytes";
@@ -59,15 +58,8 @@ impl AtomicBlobStore for InMemoryBlobs {
 fn open_store(dir: &tempfile::TempDir) -> OrbPcpStore {
     let keystore = XorKeystore { pad: [0x5A; 32] };
     let blob_store = InMemoryBlobs::default();
-    let lock = Lock::open(&dir.path().join(LOCK_FILENAME)).expect("open lock");
-    OrbPcpStore::open(
-        &dir.path().join(VAULT_FILENAME),
-        TEST_TIME,
-        &lock,
-        &keystore,
-        &blob_store,
-    )
-    .expect("open store")
+    OrbPcpStore::open(dir.path(), TEST_TIME, &keystore, &blob_store)
+        .expect("open store")
 }
 
 fn ingest(signup_id: &str) -> PcpIngest<'_> {
@@ -215,26 +207,12 @@ fn state_persists_across_reopens() {
     let blob_store = InMemoryBlobs::default();
 
     {
-        let lock = Lock::open(&dir.path().join(LOCK_FILENAME)).expect("open lock");
-        let store = OrbPcpStore::open(
-            &dir.path().join(VAULT_FILENAME),
-            TEST_TIME,
-            &lock,
-            &keystore,
-            &blob_store,
-        )
-        .expect("open store");
+        let store = OrbPcpStore::open(dir.path(), TEST_TIME, &keystore, &blob_store)
+            .expect("open store");
         store.put_package(&ingest("persist-1")).expect("put");
     }
 
-    let lock = Lock::open(&dir.path().join(LOCK_FILENAME)).expect("reopen lock");
-    let store = OrbPcpStore::open(
-        &dir.path().join(VAULT_FILENAME),
-        TEST_TIME,
-        &lock,
-        &keystore,
-        &blob_store,
-    )
-    .expect("reopen store");
+    let store = OrbPcpStore::open(dir.path(), TEST_TIME, &keystore, &blob_store)
+        .expect("reopen store");
     assert_eq!(get(&store, "persist-1").status, PackageStatus::Downloaded);
 }

@@ -12,9 +12,16 @@ use walletkit_db::{
 };
 
 use crate::storage::error::{StorageError, StorageResult};
-use crate::storage::paths::{ENVELOPE_AD, ENVELOPE_FILENAME};
 use crate::storage::schema::ensure_schema;
 use crate::storage::types::{CreationSource, PackageStatus, PcpRecord, SignupId};
+
+// On-disk format: renaming any of these orphans every existing vault.
+const VAULT_FILENAME: &str = "orb_pcp.sqlite";
+const LOCK_FILENAME: &str = "orb_pcp.lock";
+const ENVELOPE_FILENAME: &str = "orb_pcp_keys.bin";
+/// AEAD associated data for the envelope wrap. Must differ from
+/// `walletkit-core`'s credential AD.
+const ENVELOPE_AD: &[u8] = b"worldid:orb-pcp-envelope";
 
 /// Blob kind tag distinguishing PCP package bytes from any other blob
 /// kinds we add later. Must stay stable: it's hashed into `content_id`.
@@ -26,27 +33,27 @@ pub struct OrbPcpStore {
 }
 
 impl OrbPcpStore {
-    /// Open (or create) the encrypted PCP vault.
+    /// Open (or create) the encrypted PCP vault in `dir`.
     ///
     /// # Errors
     ///
-    /// Propagates envelope, vault, schema, and integrity-check failures.
+    /// Propagates lock, envelope, vault, schema, and integrity-check failures.
     pub fn open(
-        vault_path: &Path,
+        dir: &Path,
         envelope_now_seconds: u64,
-        lock: &Lock,
         keystore: &dyn Keystore,
         blob_store: &dyn AtomicBlobStore,
     ) -> StorageResult<Self> {
+        let lock = Lock::open(&dir.join(LOCK_FILENAME))?;
         let key = walletkit_db::init_or_open_envelope_key(
             keystore,
             blob_store,
-            lock,
+            &lock,
             ENVELOPE_FILENAME,
             ENVELOPE_AD,
             envelope_now_seconds,
         )?;
-        let vault = Vault::open(vault_path, &key, ensure_schema)?;
+        let vault = Vault::open(&dir.join(VAULT_FILENAME), &key, ensure_schema)?;
         Ok(Self { vault })
     }
 
@@ -123,7 +130,7 @@ impl OrbPcpStore {
         }
         let source_value = new_source
             .map(CreationSource::as_str)
-            .map_or(Value::Null, |s| Value::Text(s.to_string()));
+            .map_or(Value::Null, Value::from);
         tx.execute(
             "UPDATE pcp_records
                 SET status = ?1,
