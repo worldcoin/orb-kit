@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use orb_kit::storage::{
     paths::{LOCK_FILENAME, VAULT_FILENAME},
-    CreationSource, OrbPcpStore, PackageStatus, PcpIngest, StorageError,
+    CreationSource, OrbPcpStore, PackageStatus, PcpIngest, PcpRecord, StorageError,
 };
 use walletkit_db::{AtomicBlobStore, Keystore, Lock, StoreResult};
 
@@ -70,10 +70,9 @@ fn open_store(dir: &tempfile::TempDir) -> OrbPcpStore {
     .expect("open store")
 }
 
-fn ingest(signup_id: &str, tier: u8) -> PcpIngest<'_> {
+fn ingest(signup_id: &str) -> PcpIngest<'_> {
     PcpIngest {
         signup_id,
-        tier,
         version: "V3_0",
         signup_reason: None,
         creation_source: CreationSource::UserCentricEnrollment,
@@ -84,38 +83,30 @@ fn ingest(signup_id: &str, tier: u8) -> PcpIngest<'_> {
     }
 }
 
+fn get(store: &OrbPcpStore, signup_id: &str) -> PcpRecord {
+    store.get(signup_id).expect("get").expect("row exists")
+}
+
 #[test]
 fn put_package_writes_row_and_blob() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = open_store(&dir);
 
-    let cid = store.put_package(&ingest("abc-12345", 0)).expect("put");
-    assert_eq!(cid.len(), 32);
+    let cid = store.put_package(&ingest("abc-12345")).expect("put");
 
-    let rows = store
-        .tiers_for_signup("abc-12345")
-        .expect("tiers_for_signup");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].signup_id, "abc-12345");
-    assert_eq!(rows[0].tier, 0);
-    assert_eq!(rows[0].status, PackageStatus::Downloaded);
-    assert_eq!(
-        rows[0].creation_source,
-        CreationSource::UserCentricEnrollment
-    );
-    assert!(!rows[0].is_download_acknowledged);
+    let row = get(&store, "abc-12345");
+    assert_eq!(row.package_blob_cid, cid);
+    assert_eq!(row.status, PackageStatus::Downloaded);
+    assert_eq!(row.creation_source, CreationSource::UserCentricEnrollment);
+    assert!(!row.is_download_acknowledged);
 }
 
 #[test]
-fn status_transitions_apply_to_all_tiers() {
+fn status_transition_applies() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = open_store(&dir);
+    store.put_package(&ingest("def-67890")).expect("put");
 
-    for tier in 0..3 {
-        store
-            .put_package(&ingest("def-67890", tier))
-            .expect("put tier");
-    }
     store
         .update_status(
             "def-67890",
@@ -125,18 +116,17 @@ fn status_transitions_apply_to_all_tiers() {
         )
         .expect("transition");
 
-    let rows = store.tiers_for_signup("def-67890").expect("tiers");
-    assert_eq!(rows.len(), 3);
-    for row in &rows {
-        assert_eq!(row.status, PackageStatus::EnrollmentRequestInitiated);
-    }
+    assert_eq!(
+        get(&store, "def-67890").status,
+        PackageStatus::EnrollmentRequestInitiated
+    );
 }
 
 #[test]
 fn illegal_transition_is_rejected() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = open_store(&dir);
-    store.put_package(&ingest("xyz", 0)).expect("put");
+    store.put_package(&ingest("xyz")).expect("put");
 
     let err = store
         .update_status("xyz", PackageStatus::Enrolled, None, TEST_TIME + 1)
@@ -171,7 +161,7 @@ fn put_package_errors_when_row_already_exists() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = open_store(&dir);
 
-    store.put_package(&ingest("dup", 0)).expect("first put");
+    store.put_package(&ingest("dup")).expect("first put");
     store
         .update_status(
             "dup",
@@ -181,32 +171,29 @@ fn put_package_errors_when_row_already_exists() {
         )
         .expect("advance");
     let err = store
-        .put_package(&ingest("dup", 0))
-        .expect_err("second put on same (signup_id, tier) should error");
+        .put_package(&ingest("dup"))
+        .expect_err("second put on same signup should error");
     assert!(matches!(err, StorageError::AlreadyExists));
 
-    let rows = store.tiers_for_signup("dup").expect("tiers");
-    assert_eq!(rows[0].status, PackageStatus::EnrollmentRequestInitiated);
+    assert_eq!(
+        get(&store, "dup").status,
+        PackageStatus::EnrollmentRequestInitiated
+    );
 }
 
 #[test]
-fn mark_ack_scopes_to_one_tier() {
+fn mark_ack_clears_pending_ack() {
     let dir = tempfile::tempdir().expect("temp dir");
     let store = open_store(&dir);
+    store.put_package(&ingest("sig-1")).expect("put");
+    store.put_package(&ingest("sig-2")).expect("put");
 
-    for tier in 0..2 {
-        store.put_package(&ingest("sig-1", tier)).expect("put tier");
-    }
-    store
-        .mark_ack("sig-1", 0, TEST_TIME + 5)
-        .expect("ack tier 0");
+    store.mark_ack("sig-1", TEST_TIME + 5).expect("ack");
 
-    let rows = store.tiers_for_signup("sig-1").expect("tiers");
-    assert!(rows[0].is_download_acknowledged);
-    assert!(!rows[1].is_download_acknowledged);
+    assert!(get(&store, "sig-1").is_download_acknowledged);
     assert_eq!(
-        store.unacked_tiers().expect("unacked"),
-        vec![("sig-1".to_string(), 1)],
+        store.unacked_signups().expect("unacked"),
+        vec!["sig-2".to_string()],
     );
 }
 
@@ -216,7 +203,7 @@ fn mark_ack_errors_when_row_not_found() {
     let store = open_store(&dir);
 
     let err = store
-        .mark_ack("no-such-signup", 0, TEST_TIME + 5)
+        .mark_ack("no-such-signup", TEST_TIME + 5)
         .expect_err("ack on missing row should error");
     assert!(matches!(err, StorageError::SignupNotFound));
 }
@@ -237,7 +224,7 @@ fn state_persists_across_reopens() {
             &blob_store,
         )
         .expect("open store");
-        store.put_package(&ingest("persist-1", 0)).expect("put");
+        store.put_package(&ingest("persist-1")).expect("put");
     }
 
     let lock = Lock::open(&dir.path().join(LOCK_FILENAME)).expect("reopen lock");
@@ -249,7 +236,5 @@ fn state_persists_across_reopens() {
         &blob_store,
     )
     .expect("reopen store");
-    let rows = store.tiers_for_signup("persist-1").expect("tiers");
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].status, PackageStatus::Downloaded);
+    assert_eq!(get(&store, "persist-1").status, PackageStatus::Downloaded);
 }

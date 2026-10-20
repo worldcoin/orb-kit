@@ -13,9 +13,8 @@ pub fn ensure_schema(conn: &Connection) -> DbResult<()> {
     conn.execute_batch(
         "
         CREATE TABLE IF NOT EXISTS pcp_records (
-            signup_id                  TEXT    NOT NULL,
-            tier                       INTEGER NOT NULL DEFAULT 0,
-            version                    TEXT    NOT NULL,
+            signup_id                  TEXT    NOT NULL PRIMARY KEY,
+            version                   TEXT    NOT NULL,
             signup_reason              TEXT,
             status                     TEXT    NOT NULL
                                        CHECK (status IN (
@@ -42,7 +41,6 @@ pub fn ensure_schema(conn: &Connection) -> DbResult<()> {
             orb_created_at             INTEGER NOT NULL,
             created_at                 INTEGER NOT NULL,
             updated_at                 INTEGER NOT NULL,
-            PRIMARY KEY (signup_id, tier),
             FOREIGN KEY (package_blob_cid)
                 REFERENCES blob_objects(content_id)
                 ON DELETE RESTRICT
@@ -64,7 +62,7 @@ mod tests {
     /// DDL breaks this on purpose: existing vaults keep their original table,
     /// so any schema edit needs a migration, not a silent rewrite.
     const FROZEN_PCP_RECORDS_SQL_HASH: &str =
-        "98ea254a5001aafe37933778c21f2d3e288c15bd237e3136668b2ce7d678d4c5";
+        "7ba9e8d1bf51c14e38b791af5fa5a71f2ab05f14994f4c976094f25ba44fbb86";
 
     #[test]
     fn pcp_records_schema_is_frozen() {

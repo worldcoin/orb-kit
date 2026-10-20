@@ -8,7 +8,7 @@ Part of the [World ID SDK](https://docs.world.org/world-id).
 
 ## What OrbKit does
 
-- Holds the user's PCPs in an encrypted, on-device vault, one row per tier of a signup.
+- Holds the user's PCPs in an encrypted, on-device vault, one row per signup.
 - Tracks each signup's enrollment lifecycle as a status state machine.
 
 Storage and encryption come from [`walletkit-db`](https://github.com/worldcoin/walletkit/tree/main/crates/walletkit-db); see its README for the key hierarchy and threat model. The API lives in [`src/storage`](src/storage).

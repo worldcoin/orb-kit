@@ -21,7 +21,7 @@ pub enum StorageError {
     Db(#[from] DbError),
     #[error("no rows for the requested signup")]
     SignupNotFound,
-    #[error("row already exists for the requested signup/tier")]
+    #[error("row already exists for the requested signup")]
     AlreadyExists,
     #[error("illegal status transition: {from} -> {to}")]
     IllegalTransition {

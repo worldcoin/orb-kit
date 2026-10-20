@@ -7,9 +7,6 @@ use crate::storage::error::StorageError;
 /// Server-assigned signup identifier. Sensitive; do not log.
 pub type SignupId = String;
 
-/// Shard index within a signup. `0` for untiered PCPs.
-pub type Tier = u8;
-
 /// Lifecycle state of one PCP row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(missing_docs, reason = "names are the documentation")]
@@ -134,7 +131,6 @@ impl CreationSource {
 #[expect(missing_docs, reason = "names are the documentation")]
 pub struct PcpRecord {
     pub signup_id: SignupId,
-    pub tier: Tier,
     pub version: String,
     pub signup_reason: Option<String>,
     pub status: PackageStatus,

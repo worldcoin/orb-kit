@@ -8,4 +8,4 @@ pub mod types;
 
 pub use error::{StorageError, StorageResult};
 pub use store::{OrbPcpStore, PcpIngest};
-pub use types::{CreationSource, PackageStatus, PcpRecord, SignupId, Tier};
+pub use types::{CreationSource, PackageStatus, PcpRecord, SignupId};
