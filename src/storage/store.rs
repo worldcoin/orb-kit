@@ -70,21 +70,34 @@ impl OrbPcpStore {
         let orb_i64 = to_i64(ingest.orb_created_at_seconds, "orb_created_at")?;
         let conn = self.vault.connection();
         let tx = conn.transaction()?;
+        let stored_cid = conn.query_row_optional(
+            "UPDATE pcp_records
+                SET is_download_acknowledged = is_download_acknowledged OR ?1
+              WHERE signup_id = ?2
+              RETURNING package_blob_cid",
+            params![
+                i64::from(u8::from(ingest.is_download_acknowledged)),
+                ingest.signup_id,
+            ],
+            |row| Ok(row.column_blob(0)),
+        )?;
+        if let Some(stored_cid) = stored_cid {
+            let cid = to_cid(stored_cid)?;
+            tx.commit()?;
+            return Ok(cid);
+        }
         let cid = blobs::put(
             conn,
             KIND_PCP_PACKAGE,
             ingest.encrypted_bytes,
             ingest.now_seconds,
         )?;
-        let stored_cid = conn.query_row(
+        tx.execute(
             "INSERT INTO pcp_records (
                 signup_id, version, signup_reason,
                 status, is_download_acknowledged, creation_source,
                 package_blob_cid, orb_created_at, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
-             ON CONFLICT (signup_id) DO UPDATE SET is_download_acknowledged =
-                 is_download_acknowledged OR excluded.is_download_acknowledged
-             RETURNING package_blob_cid",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)",
             params![
                 ingest.signup_id,
                 ingest.version,
@@ -96,10 +109,9 @@ impl OrbPcpStore {
                 orb_i64,
                 now_i64,
             ],
-            |row| Ok(row.column_blob(0)),
         )?;
         tx.commit()?;
-        to_cid(stored_cid)
+        Ok(cid)
     }
 
     /// Move a signup to `new_status`. Idempotent.
@@ -249,4 +261,42 @@ fn to_cid(bytes: Vec<u8>) -> StorageResult<[u8; 32]> {
     <[u8; 32]>::try_from(bytes).map_err(|_| {
         StorageError::InvalidState(format!("package_blob_cid len {len} != 32"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_schema, CreationSource, OrbPcpStore, PcpIngest, Vault};
+
+    #[test]
+    fn repeat_download_does_not_store_unused_blobs() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key = Box::new([0x42; 32]).into();
+        let vault = Vault::open(&dir.path().join("vault.sqlite"), &key, ensure_schema)
+            .expect("open vault");
+        let store = OrbPcpStore { vault };
+        let mut ingest = PcpIngest {
+            signup_id: "signup",
+            version: "3",
+            signup_reason: None,
+            creation_source: CreationSource::UserCentricEnrollment,
+            is_download_acknowledged: false,
+            encrypted_bytes: b"original",
+            orb_created_at_seconds: 1,
+            now_seconds: 2,
+        };
+        let cid = store.put_package(&ingest).expect("first put");
+
+        for bytes in [b"original".as_slice(), b"different"] {
+            ingest.encrypted_bytes = bytes;
+            assert_eq!(store.put_package(&ingest).expect("repeat put"), cid);
+            let count = store
+                .vault
+                .connection()
+                .query_row("SELECT COUNT(*) FROM blob_objects", &[], |row| {
+                    Ok(row.column_i64(0))
+                })
+                .expect("count blobs");
+            assert_eq!(count, 1);
+        }
+    }
 }
